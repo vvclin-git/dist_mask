@@ -35,16 +35,24 @@ def extract_samples(video, roi, paths):
             f"crop={width}:{height}:{x}:{y}:exact=1[out]",
             encoding='ascii',
         )
-        result = subprocess.run(
-            [ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-xerror',
-             '-filter_complex_threads', '1', '-i', str(video),
-             '-filter_complex_script', str(graph), '-map', '[out]',
-             '-fps_mode', 'passthrough', '-frames:v', str(len(missing)),
-             '-c:v', 'png', '-pix_fmt', 'rgb24', '-compression_level', '1',
-             '-start_number', '0', str(stage / '%08d.png')],
-            capture_output=True, text=True, encoding='utf-8', errors='replace',
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-        )
+        command = [
+            ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-xerror',
+            '-filter_complex_threads', '1', '-i', str(video),
+        ]
+        output = [
+            str(graph), '-map', '[out]',
+            '-fps_mode', 'passthrough', '-frames:v', str(len(missing)),
+            '-c:v', 'png', '-pix_fmt', 'rgb24', '-compression_level', '1',
+            '-start_number', '0', str(stage / '%08d.png'),
+        ]
+        for option in ('-/filter_complex', '-filter_complex_script'):
+            result = subprocess.run(
+                [*command, option, *output],
+                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+            if not (result.returncode and "Unrecognized option '/filter_complex'" in result.stderr):
+                break
         if result.returncode:
             raise ValueError(f'FFmpeg 抽幀失敗：{result.stderr.strip()}')
         extracted = sorted(stage.glob('*.png'))
