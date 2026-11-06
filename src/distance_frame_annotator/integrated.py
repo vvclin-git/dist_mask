@@ -1,8 +1,10 @@
 """Video sampling host for the pixel mask editor."""
+from bisect import bisect_left, bisect_right
 import csv
 import hashlib
 import json
 import math
+import secrets
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -12,8 +14,13 @@ import numpy as np
 from PIL import Image
 from pixel_annotator.app import AnnotationApp
 from pixel_annotator.io_utils import build_annotation_metadata
-from .core import load_rows, sample_rows, VideoReader, validate_roi
+from .core import distance_workspace, load_rows, sample_rows, VideoReader, validate_roi
 from .storage import AnnotationStore, atomic_json, source_id, translate_proposal
+
+
+DEFAULTS_PATH = Path.home() / '.dist_mask' / 'defaults.json'
+DEFAULT_KEYS = ('field', 'width', 'count', 'gap', 'seed', 'roi')
+WORKSPACE_KEYS = ('distance_min', 'distance_max')
 
 
 class Editor(AnnotationApp):
@@ -165,6 +172,15 @@ class App:
         defaults = {'csv': '', 'video': '', 'out': 'annotations_output', 'field': 'buoy',
                     'width': '10', 'count': '3', 'gap': '30', 'seed': '42',
                     'roi': '0,0,960,711', 'step': '1', 'frame': '0', 'radius': '40', 'score': '.75'}
+        defaults.update(dict.fromkeys(WORKSPACE_KEYS, ''))
+        if DEFAULTS_PATH.is_file():
+            try:
+                saved = json.loads(DEFAULTS_PATH.read_text(encoding='utf-8'))
+                if not isinstance(saved, dict):
+                    raise ValueError('Invalid defaults')
+                defaults.update({key: saved[key] for key in DEFAULT_KEYS if isinstance(saved.get(key), str)})
+            except (OSError, ValueError):
+                self.status.set('無法讀取預設設定，已使用內建值')
         self.v = {k: tk.StringVar(value=v) for k, v in defaults.items()}
         top = ttk.Frame(root)
         top.pack(fill='x')
@@ -179,6 +195,16 @@ class App:
                            ('gap', '最小間隔'), ('seed', 'seed'), ('roi', '裁切 ROI x,y,w,h')]:
             ttk.Label(parameters, text=label).pack(side='left')
             ttk.Entry(parameters, textvariable=self.v[key], width=22 if key == 'roi' else 7).pack(side='left')
+        ttk.Button(parameters, text='產生新 seed', command=self.new_seed).pack(side='left')
+        workspace = ttk.Frame(root)
+        workspace.pack(fill='x')
+        ttk.Label(workspace, text='距離工作區 (m)').pack(side='left')
+        for key, label in zip(WORKSPACE_KEYS, ('下限', '上限')):
+            ttk.Label(workspace, text=label).pack(side='left')
+            ttk.Entry(workspace, textvariable=self.v[key], width=9).pack(side='left')
+        ttk.Label(workspace, text='留空表示不限').pack(side='left')
+        ttk.Button(workspace, text='保存為預設值',
+                   command=lambda: self.guard(self.save_defaults)).pack(side='left')
         buttons = ttk.Frame(root)
         buttons.pack(fill='x')
         for label, callback in [('載入／套用並取樣', self.sample), ('手動畫裁切 ROI', self.pick_roi),
@@ -285,12 +311,30 @@ class App:
     def settings(self):
         return {key: value.get() for key, value in self.v.items()}
 
+    def new_seed(self):
+        seed = str(secrets.randbelow(2**31))
+        if seed == self.v['seed'].get():
+            seed = str((int(seed) + 1) % 2**31)
+        self.v['seed'].set(seed)
+        self.status.set('已產生新 seed，按「載入／套用並取樣」更新取樣')
+
+    def save_defaults(self):
+        atomic_json(DEFAULTS_PATH, {key: self.v[key].get() for key in DEFAULT_KEYS})
+        self.status.set(f'已保存預設值至 {DEFAULTS_PATH}')
+
     def load_source(self, settings, samples=None, frame=None, identity=None, cursor=0):
         if not self.leave():
             return False
+        settings = {**dict.fromkeys(WORKSPACE_KEYS, ''), **settings}
         rows = load_rows(settings['csv'], settings['field'], settings['video'])
         if len({r['video'] for r in rows}) != 1:
             raise ValueError('一次僅支援一支影片的 CSV')
+        bounds = [settings[key] for key in WORKSPACE_KEYS]
+        restricted = any(bound.strip() for bound in bounds)
+        rows = distance_workspace(rows, *bounds)
+        if not rows:
+            raise ValueError('距離工作區內沒有有效影格')
+        allowed_frames = {row['frame_index'] for row in rows}
         roi = [int(x.strip()) for x in settings['roi'].split(',')]
         if len(roi) != 4:
             raise ValueError('ROI requires four values')
@@ -301,6 +345,10 @@ class App:
         if identity and identity != identity_now:
             raise ValueError('所選影片與 session 來源不符')
         selected = samples if samples is not None else sample_rows(rows, width, int(settings['count']), int(settings['gap']), int(settings['seed']))
+        if restricted:
+            selected = [row for row in selected if row['frame_index'] in allowed_frames]
+            if frame is not None and int(frame) not in allowed_frames:
+                frame = None
         selected = sorted(selected, key=lambda r: (float(r['distance_m']), int(r['frame_index'])))
         if not selected:
             raise ValueError('沒有可用取樣')
@@ -317,12 +365,13 @@ class App:
             reader.close()
             raise
         same = self.active and self.active['identity'] == identity_now and self.active['roi'] == roi and self.active['settings']['field'] == settings['field']
-        if not same:
+        if not same or (restricted and self.last_saved and self.last_saved['frame'] not in allowed_frames):
             self.last_saved = None
         if self.reader:
             self.reader.close()
         self.reader, self.store = reader, store
-        self.active = {'settings': settings.copy(), 'identity': identity_now, 'roi': roi, 'width': width}
+        self.active = {'settings': settings.copy(), 'identity': identity_now, 'roi': roi, 'width': width,
+                       'workspace_frames': sorted(allowed_frames) if restricted else None}
         self.rows, self.lookup = rows, {r['frame_index']: r for r in rows}
         self.samples, self.cursor = selected, max(0, min(cursor, len(selected)-1))
         self.reference = None
@@ -343,7 +392,7 @@ class App:
     def ensure_applied(self):
         if self.active is None:
             raise ValueError('請先載入影片')
-        for key in ('csv', 'video', 'out', 'field', 'width', 'count', 'gap', 'seed', 'roi'):
+        for key in ('csv', 'video', 'out', 'field', 'width', 'count', 'gap', 'seed', 'roi', *WORKSPACE_KEYS):
             if self.v[key].get() != self.active['settings'][key]:
                 raise ValueError('設定已變更，請先「載入／套用並取樣」；還原設定可先保存舊標註。')
 
@@ -387,6 +436,8 @@ class App:
 
     def show(self, frame):
         self.ensure_applied()
+        if self.active['workspace_frames'] is not None and frame not in self.lookup:
+            raise ValueError('該影格不在距離工作區內，或缺少有效距離')
         if frame == self.current:
             return True
         total = int(self.reader.cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -432,7 +483,15 @@ class App:
         step = int(self.v['step'].get())
         if step < 1:
             raise ValueError('步長須大於零')
-        self.show(self.current + direction*step if self.current is not None else 0)
+        self.ensure_applied()
+        target = self.current + direction * step
+        frames = self.active['workspace_frames']
+        if frames is not None:
+            index = bisect_left(frames, target) if direction > 0 else bisect_right(frames, target) - 1
+            if not 0 <= index < len(frames):
+                return
+            target = frames[index]
+        self.show(target)
 
     def pick_roi(self):
         self.ensure_applied()
@@ -556,7 +615,7 @@ class App:
         if self.load_source(settings, samples, current, data.get('source_id'), cursor):
             self.last_saved = None
             recent = data.get('last_saved_frame')
-            if recent is not None:
+            if recent is not None and (self.active['workspace_frames'] is None or int(recent) in self.lookup):
                 mask, record = self.store.load(int(recent), self.active['roi'])
                 if record is not None:
                     crop = validate_roi(self.active['roi'], self.reader.get(int(recent)))

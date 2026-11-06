@@ -70,6 +70,24 @@ def load_track_lab_rows(rows, field, video):
     return sorted(result.values(), key=lambda row: (row['video'], row['frame_index']))
 
 
+def distance_workspace(rows, minimum='', maximum=''):
+    try:
+        lower = float(minimum) if minimum.strip() else None
+        upper = float(maximum) if maximum.strip() else None
+    except ValueError as exc:
+        raise ValueError('距離工作區上下限須為數字') from exc
+    if any(bound is not None and (not math.isfinite(bound) or bound < 0)
+           for bound in (lower, upper)):
+        raise ValueError('距離工作區上下限須為非負有限數值')
+    if lower is not None and upper is not None and lower > upper:
+        raise ValueError('距離工作區下限不得大於上限')
+    return [
+        row for row in rows
+        if (lower is None or row['distance_m'] >= lower)
+        and (upper is None or row['distance_m'] <= upper)
+    ]
+
+
 def sample_rows(rows, width, count, gap, seed):
     if not math.isfinite(width) or width <= 0 or count < 1 or gap < 0:
         raise ValueError('Invalid sampling parameters')

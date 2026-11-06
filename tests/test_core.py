@@ -51,3 +51,24 @@ def test_ocr_import_keeps_existing_filters(tmp_path):
         encoding='utf-8',
     )
     assert [r['frame_index'] for r in load_rows(path, 'ships', 'renamed.mp4')] == [1]
+
+
+def test_distance_workspace_filters_before_sampling():
+    from distance_frame_annotator.core import distance_workspace
+
+    rows = [dict(video='v', frame_index=i, distance_m=i) for i in range(20)]
+    assert distance_workspace(rows) == rows
+    assert distance_workspace(rows, '', '1') == rows[:2]
+    assert distance_workspace(rows, '18', '') == rows[18:]
+    bounded = distance_workspace(rows, '8', '11')
+    assert bounded == rows[8:12]
+    assert {r['bin_lower_m'] for r in sample_rows(bounded, 10, 10, 0, 42)} == {0, 10}
+
+
+def test_distance_workspace_rejects_invalid_bounds():
+    import pytest
+    from distance_frame_annotator.core import distance_workspace
+
+    for lower, upper in [('nan', ''), ('', 'inf'), ('-1', ''), ('5', '4'), ('bad', '')]:
+        with pytest.raises(ValueError):
+            distance_workspace([], lower, upper)
