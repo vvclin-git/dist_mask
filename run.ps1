@@ -1,3 +1,7 @@
-Set-Location $PSScriptRoot
-uv sync --locked
-if ($LASTEXITCODE -eq 0) { uv run --locked distance-annotator }
+$ErrorActionPreference = 'Stop'
+Set-Location -LiteralPath $PSScriptRoot
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    Write-Error 'uv was not found on PATH.'
+}
+uv run --locked --no-dev distance-annotator
+exit $LASTEXITCODE

@@ -5,16 +5,17 @@ import hashlib
 import json
 import math
 import secrets
+import shutil
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import cv2
 import numpy as np
-from PIL import Image
 from pixel_annotator.app import AnnotationApp
 from pixel_annotator.io_utils import build_annotation_metadata
 from .core import distance_workspace, load_rows, sample_rows, VideoReader, validate_roi
+from .extraction import extract_samples, read_sample
 from .storage import AnnotationStore, atomic_json, source_id, translate_proposal
 
 
@@ -360,6 +361,14 @@ class App:
             total = int(reader.cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if any(int(r['frame_index']) < 0 or (total > 0 and int(r['frame_index']) >= total) for r in selected):
                 raise ValueError('取樣 frame 超過影片範圍；請確認 CSV 對應影片')
+            cache = store.folder / 'sample_cache'
+            paths = {row['frame_index']: cache / (store.key(row['frame_index'], roi) + '.png')
+                     for row in selected}
+            self.status.set('正在準備 FFmpeg 取樣影像，首次抽幀可能需要一些時間')
+            self.root.update_idletasks()
+            extract_samples(settings['video'], roi, paths)
+            if first in paths:
+                crop = read_sample(paths[first], roi)
             mask, record = store.load(first, roi)
         except Exception:
             reader.close()
@@ -371,7 +380,7 @@ class App:
             self.reader.close()
         self.reader, self.store = reader, store
         self.active = {'settings': settings.copy(), 'identity': identity_now, 'roi': roi, 'width': width,
-                       'workspace_frames': sorted(allowed_frames) if restricted else None}
+                       'sample_paths': paths, 'workspace_frames': sorted(allowed_frames) if restricted else None}
         self.rows, self.lookup = rows, {r['frame_index']: r for r in rows}
         self.samples, self.cursor = selected, max(0, min(cursor, len(selected)-1))
         self.reference = None
@@ -434,6 +443,12 @@ class App:
         recent = self.last_saved['frame'] if self.last_saved else '無'
         self.status.set(f'取樣 {self.cursor+1}/{len(self.samples)}（定位 {self.samples[self.cursor]["frame_index"]}） | 目前 frame {self.current} | 距離 {self.row()["distance_m"]} m | {state} | 參考 {reference} | 最近保存 {recent}')
 
+    def load_crop(self, frame):
+        path = self.active['sample_paths'].get(frame)
+        if path is not None:
+            return read_sample(path, self.active['roi'])
+        return validate_roi(self.active['roi'], self.reader.get(frame))
+
     def show(self, frame):
         self.ensure_applied()
         if self.active['workspace_frames'] is not None and frame not in self.lookup:
@@ -445,7 +460,7 @@ class App:
             raise ValueError('Frame outside video range')
         if not self.leave():
             return False
-        crop = validate_roi(self.active['roi'], self.reader.get(frame))
+        crop = self.load_crop(frame)
         mask, record = self.store.load(frame, self.active['roi'])
         self.install(frame, crop, mask, record)
         return True
@@ -618,7 +633,7 @@ class App:
             if recent is not None and (self.active['workspace_frames'] is None or int(recent) in self.lookup):
                 mask, record = self.store.load(int(recent), self.active['roi'])
                 if record is not None:
-                    crop = validate_roi(self.active['roi'], self.reader.get(int(recent)))
+                    crop = self.load_crop(int(recent))
                     self.last_saved = {'frame': int(recent), 'roi': self.active['roi'].copy(),
                                        'rgb': cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), 'mask': mask.copy()}
             self.update_status()
@@ -643,9 +658,8 @@ class App:
         self.root.update_idletasks()
         try:
             for row in self.samples:
-                crop = validate_roi(self.active['roi'], self.reader.get(row['frame_index']))
                 path = out / (self.store.key(row['frame_index'], self.active['roi'])+'.png')
-                Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).save(path)
+                shutil.copyfile(self.active['sample_paths'][row['frame_index']], path)
                 records.append({**row, 'image': path.name, 'crop_roi': json.dumps(self.active['roi'])})
             with (out/'samples.csv').open('w', encoding='utf-8-sig', newline='') as stream:
                 writer = csv.DictWriter(stream, fieldnames=list(records[0]))
