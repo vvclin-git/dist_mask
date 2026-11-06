@@ -16,6 +16,15 @@ def read_sample(path, roi):
         return cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
 
 
+def frame_selection(frames):
+    if len(frames) == 1:
+        return f'eq(n,{frames[0]})'
+    middle = len(frames) // 2
+    left = frame_selection(frames[:middle])
+    right = frame_selection(frames[middle:])
+    return f'if(lt(n,{frames[middle]}),{left},{right})'
+
+
 def extract_samples(video, roi, paths):
     missing = sorted((frame, path) for frame, path in paths.items() if not path.is_file())
     if not missing:
@@ -29,7 +38,7 @@ def extract_samples(video, roi, paths):
     with TemporaryDirectory(prefix='extract-', dir=folder) as directory:
         stage = Path(directory)
         graph = stage / 'frames.txt'
-        selection = '+'.join(f'eq(n,{frame})' for frame, _ in missing)
+        selection = frame_selection([frame for frame, _ in missing])
         graph.write_text(
             f"[0:v:0]select='{selection}',format=rgb24,"
             f"crop={width}:{height}:{x}:{y}:exact=1[out]",
