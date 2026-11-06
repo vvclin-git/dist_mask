@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local annotation and OCR outputs
+/output/
+/annotations_output/
